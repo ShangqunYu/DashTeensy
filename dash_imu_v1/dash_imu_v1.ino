@@ -1,14 +1,18 @@
 /*
  * Dash IMU Teensy 4.1 -- VN-100 serial to UDP bridge.
  *
- * Third board on the torso, alongside the two dash_v1 motor relays.  It does
- * exactly one job: read the VN-100's binary output on Serial2 and forward each
- * sample to the host over ethernet.  No CAN, no motors, no control.
+ * Third board on the torso, alongside the two dash_v1 motor relays.  It reads
+ * the VN-100's binary output on Serial2 and the RC receiver's SBUS on Serial7,
+ * and forwards both to the host over ethernet.  No CAN, no motors, no control.
  *
  * Adapted from the lab's vn100_imu_and_rc_teensy sketch (Flight Dynamics and
  * Control Lab, MIT licence -- see the notice at the bottom).  What changed:
  *
- *   - The SBUS/RC half is gone.  Dash has no RC receiver, and Serial7 is free.
+ *   - SBUS still arrives on Serial7, but leaves as a CRC-sealed DashRcPacket on
+ *     the IMU's own stream rather than an ASCII line to a second port.  The
+ *     failsafe flag, which the lab's host parser ignored, is passed through,
+ *     and a heartbeat marks a receiver that has gone silent -- the original
+ *     sent nothing then, which looked exactly like sticks held still.
  *   - Static IP moved from the old 10.0.0.x lab net onto Dash's 192.168.0.x,
  *     next to the two relay boards.
  *   - ASCII "%f,%f,..." replaced by a packed binary struct with a magic
@@ -35,6 +39,7 @@
 
 #include "DashImuProtocol.h"
 #include "Watchdog_t4.h"
+#include "sbus.h"
 
 // ===========================================================================
 //   Configuration
@@ -63,17 +68,20 @@ static constexpr uint32_t kSubscriberTimeoutMs = 2000;
 // stream; TX is wired so the IMU can be configured over the same cable using
 // the passthrough below.
 //
-// 115200 is the VN-100 factory default and is what the lab sketch used, but it
-// is NOT comfortable here: a 46-byte frame costs 4.0 ms of the 5.0 ms sample
-// period at 200 Hz, i.e. 80% of the line.  One retimed byte and the frame runs
-// into the next.  Raise the IMU to 460800 (README has the command) and change
-// this to match -- then it is 1.0 ms in 5.0.
+// 115200 is the VN-100 factory default and is what the lab sketch used.  A
+// 46-byte frame costs 4.0 ms of the 5.0 ms sample period at 200 Hz; that has
+// measured error-free, but leaves little room to raise the rate.  To go faster,
+// set the IMU to 460800 (README has the command) and change this to match.
 static constexpr uint32_t kImuBaud = 115200;
 
-// Enlarges Serial2's 64-byte default RX buffer.  A frame plus its sync byte is
-// 46 bytes, so the default leaves 18 bytes of slack for scheduling jitter --
-// enough until it isn't, and an overrun looks like a CRC failure.
-static constexpr size_t kImuRxBufferBytes = 512;
+// Enlarges Serial2's 64-byte default RX buffer.  The IMU delivers 9200 bytes/s
+// (46 x 200 Hz) whatever the baud rate, so this is how long loop() may stall
+// before bytes are lost: 4096 bytes = 445 ms.  The UART interrupt drops bytes
+// silently when the buffer is full, and an overrun only ever shows up as
+// bad_crc + resyncs.  512 bytes (55 ms) was measurably not enough: a USB serial
+// print blocks for 120 ms when the host stops reading, and every such stall
+// cost exactly one frame.
+static constexpr size_t kImuRxBufferBytes = 4096;
 
 // Bridges USB serial <-> Serial2 so the IMU can be configured from the Arduino
 // serial monitor without unplugging anything.  Leave it off for normal running:
@@ -83,7 +91,27 @@ static constexpr size_t kImuRxBufferBytes = 512;
 #define DEBUG_MODE
 
 #ifdef DEBUG_MODE
-#define debug_print(...) Serial.printf(__VA_ARGS__)
+#include <stdarg.h>
+// Never blocks.  Serial.printf() waits up to 120 ms whenever the USB buffers
+// are full -- which they are a few seconds after a serial monitor closes, since
+// nothing drains them -- and that stall costs IMU bytes.  So a line goes out
+// only if a terminal has the port open and the whole line fits in buffers that
+// are already free; otherwise it is dropped.  A lost console line is fine; a
+// lost sample is not.
+static void debug_print(const char *fmt, ...)
+    __attribute__((format(printf, 1, 2)));
+static void debug_print(const char *fmt, ...) {
+  if (!Serial) return;
+  char line[256];
+  va_list args;
+  va_start(args, fmt);
+  const int n = vsnprintf(line, sizeof(line), fmt, args);
+  va_end(args);
+  if (n <= 0) return;
+  const size_t len = (size_t)n < sizeof(line) ? (size_t)n : sizeof(line) - 1;
+  if (Serial.availableForWrite() < (int)len) return;
+  Serial.write((const uint8_t *)line, len);
+}
 #else
 #define debug_print(...) \
   do {                   \
@@ -114,6 +142,20 @@ static constexpr int kVnFrameBytes = 1 + 2 + kVnPayloadBytes + 2;
 // changes the LED and prints a warning.
 static constexpr uint32_t kImuTimeoutMs = 200;
 
+// ---- RC receiver -----------------------------------------------------------
+//
+// FrSky X8R SBUS port -> pin 28 (RX7); TX7 is not used.  SBUS is inverted
+// serial at 100000 baud 8E2, and bfs::SbusRx inverts inside the Teensy's UART,
+// so no external inverter.  Teensy 4.1 pins are NOT 5 V tolerant.
+//
+// Enlarges Serial7's 64-byte RX buffer.  An SBUS frame is 25 bytes, so the
+// default holds two -- one slow pass through loop() (an ethernet send that
+// takes its time) and the parser starts on a frame whose head was overwritten.
+static constexpr size_t kRcRxBufferBytes = 256;
+
+// While no SBUS frame arrives, a NoSignal heartbeat goes out this often.
+static constexpr uint32_t kRcHeartbeatMs = 100;
+
 // ===========================================================================
 
 using namespace qindesign::network;
@@ -137,6 +179,17 @@ static uint16_t g_bad_crc = 0;
 static uint16_t g_resyncs = 0;
 static bool g_bad_format = false;
 static uint32_t g_send_fail = 0;
+
+bfs::SbusRx g_sbus(&Serial7);
+static uint8_t g_rc_rx_buffer[kRcRxBufferBytes];
+static uint16_t g_rc_ch[kDashRcNumChannels];  /* last frame; zeros until one */
+static uint32_t g_rc_seq = 0;
+static uint32_t g_rc_frames = 0;
+static uint32_t g_last_rc_ms = 0;
+static bool g_have_rc = false;
+static uint16_t g_rc_lost_frames = 0;
+static uint32_t g_last_rc_heartbeat_ms = 0;
+static bool g_rc_failsafe = false;
 
 // Saturating, because these are diagnostics: a counter that wrapped to 3 looks
 // like a healthy link, and 65535 does not.
@@ -197,6 +250,8 @@ void setup() {
               kDashImuProtoVersion, (unsigned)sizeof(DashImuPacket));
   debug_print("[dash_imu_v1] IMU on Serial2 at %lu baud\n",
               (unsigned long)kImuBaud);
+  debug_print("[dash_imu_v1] RC SBUS on Serial7 (pin 28), packet %u bytes\n",
+              (unsigned)sizeof(DashRcPacket));
   debug_print("=====================================================\n");
 
   pinMode(LED_BUILTIN, OUTPUT);
@@ -207,6 +262,16 @@ void setup() {
   // is already buffered, so this should never fire -- but the default is 1000 ms
   // and a single stall that long would take the watchdog with it.
   Serial2.setTimeout(5);
+
+  g_sbus.Begin();
+  Serial7.addMemoryForRead(g_rc_rx_buffer, sizeof(g_rc_rx_buffer));
+
+  // The IMU outranks the RC receiver.  Both UARTs default to priority 64, so an
+  // RC byte's interrupt could hold off an IMU byte while it sits in the UART's
+  // small hardware FIFO.  0 is highest; the Cortex-M7 honours steps of 16.
+  // After begin(), which is what sets the default.
+  NVIC_SET_PRIORITY(IRQ_LPUART4, 32);  // Serial2, IMU
+  NVIC_SET_PRIORITY(IRQ_LPUART7, 96);  // Serial7, RC
 
 #if !DASH_IMU_CONFIG_PASSTHROUGH
   WDT_timings_t config;
@@ -264,27 +329,15 @@ void receiveHello() {
   }
 }
 
-void sendSample(const float *quat, const float *gyro, const float *accel) {
-  if (!g_have_subscriber && !kAutostream) return;
+static uint8_t currentStatus() {
+  return (uint8_t)((g_link_up ? kDashImuStatusLink : 0) |
+                   (g_have_subscriber ? kDashImuStatusSubscribed : 0) |
+                   (g_bad_format ? kDashImuStatusBadFormat : 0));
+}
 
-  DashImuPacket pkt;
-  memset(&pkt, 0, sizeof(pkt));
-  pkt.magic = kDashImuMagicData;
-  pkt.version = kDashImuProtoVersion;
-  pkt.status = (uint8_t)((g_link_up ? kDashImuStatusLink : 0) |
-                         (g_have_subscriber ? kDashImuStatusSubscribed : 0) |
-                         (g_bad_format ? kDashImuStatusBadFormat : 0));
-  pkt.seq = g_seq;
-  pkt.teensy_us = micros();
-  pkt.bad_crc = g_bad_crc;
-  pkt.resyncs = g_resyncs;
-  memcpy(pkt.quat, quat, sizeof(pkt.quat));
-  memcpy(pkt.gyro, gyro, sizeof(pkt.gyro));
-  memcpy(pkt.accel, accel, sizeof(pkt.accel));
-  dash_imu_seal(&pkt);
-
-  if (!udp.send(g_host_ip, g_host_port, (const uint8_t *)&pkt, sizeof(pkt))) {
-    // Rate-limited on purpose.  This fires once per sample, and autostreaming
+void sendDatagram(const uint8_t *data, size_t size) {
+  if (!udp.send(g_host_ip, g_host_port, data, size)) {
+    // Rate-limited on purpose.  This fires once per packet, and autostreaming
     // at 200 Hz to a host that has nothing bound to the port makes every one of
     // them fail -- which at one printf each is 200 lines a second of USB serial
     // for a condition that is not even an error.
@@ -301,12 +354,89 @@ void sendSample(const float *quat, const float *gyro, const float *accel) {
   }
 }
 
+void sendSample(const float *quat, const float *gyro, const float *accel) {
+  if (!g_have_subscriber && !kAutostream) return;
+
+  DashImuPacket pkt;
+  memset(&pkt, 0, sizeof(pkt));
+  pkt.magic = kDashImuMagicData;
+  pkt.version = kDashImuProtoVersion;
+  pkt.status = currentStatus();
+  pkt.seq = g_seq;
+  pkt.teensy_us = micros();
+  pkt.bad_crc = g_bad_crc;
+  pkt.resyncs = g_resyncs;
+  memcpy(pkt.quat, quat, sizeof(pkt.quat));
+  memcpy(pkt.gyro, gyro, sizeof(pkt.gyro));
+  memcpy(pkt.accel, accel, sizeof(pkt.accel));
+  dash_imu_seal(&pkt);
+  sendDatagram((const uint8_t *)&pkt, sizeof(pkt));
+}
+
+void sendRc(uint8_t flags, uint16_t age_ms) {
+  if (!g_have_subscriber && !kAutostream) return;
+
+  DashRcPacket pkt;
+  memset(&pkt, 0, sizeof(pkt));
+  pkt.magic = kDashRcMagicData;
+  pkt.version = kDashImuProtoVersion;
+  pkt.status = currentStatus();
+  pkt.seq = ++g_rc_seq;
+  pkt.teensy_us = micros();
+  pkt.flags = flags;
+  pkt.lost_frames = g_rc_lost_frames;
+  pkt.age_ms = age_ms;
+  memcpy(pkt.ch, g_rc_ch, sizeof(pkt.ch));
+  dash_rc_seal(&pkt);
+  sendDatagram((const uint8_t *)&pkt, sizeof(pkt));
+}
+
+// Forwards the newest SBUS frame if one has arrived, or a NoSignal heartbeat
+// once none has for kDashRcNoSignalMs.
+//
+// SbusRx::Read() drains every buffered byte and keeps only the last complete
+// frame, so this never blocks, and a backlog after a stall costs stale frames
+// rather than time.  It also means lost_frames counts the frames we saw, not
+// every frame the receiver sent.
+void pollRc() {
+  const uint32_t now = millis();
+  if (g_sbus.Read()) {
+    const bfs::SbusData d = g_sbus.data();
+    for (int i = 0; i < kDashRcNumChannels; ++i) g_rc_ch[i] = (uint16_t)d.ch[i];
+    uint8_t flags = 0;
+    if (d.lost_frame) {
+      flags |= kDashRcFlagLostFrame;
+      bumpSaturating(&g_rc_lost_frames);
+    }
+    if (d.failsafe) flags |= kDashRcFlagFailsafe;
+    if (d.ch17) flags |= kDashRcFlagCh17;
+    if (d.ch18) flags |= kDashRcFlagCh18;
+    g_rc_failsafe = d.failsafe;
+    g_have_rc = true;
+    g_last_rc_ms = now;
+    ++g_rc_frames;
+    sendRc(flags, 0);
+    return;
+  }
+
+  if (g_have_rc && (now - g_last_rc_ms) < kDashRcNoSignalMs) return;
+  if ((now - g_last_rc_heartbeat_ms) < kRcHeartbeatMs) return;
+  g_last_rc_heartbeat_ms = now;
+  const uint32_t age = g_have_rc ? (now - g_last_rc_ms) : 0xFFFF;
+  sendRc(kDashRcFlagNoSignal, (uint16_t)(age < 0xFFFF ? age : 0xFFFF));
+}
+
 // Consumes one buffered VN-100 frame if a whole one is present.  Returns true
 // if a sample was parsed and forwarded.
 //
 // The wait for a COMPLETE frame before touching the sync byte is what keeps
 // this non-blocking: once available() clears the bar, readBytes() is a memcpy
 // out of the ring buffer and cannot stall waiting on the wire.
+// False until the first frame passes its CRC.  The board almost always starts
+// listening partway through a frame, and hunting past that fragment -- or
+// tripping over an 0xFA inside it -- is not a data error, so it is not counted.
+static bool g_imu_locked = false;
+
 bool readOneSample() {
   if (Serial2.available() < kVnFrameBytes + 1) return false;
 
@@ -318,7 +448,7 @@ bool readOneSample() {
     Serial2.read();
     discarded = true;
   }
-  if (discarded) bumpSaturating(&g_resyncs);
+  if (discarded && g_imu_locked) bumpSaturating(&g_resyncs);
   if (Serial2.available() < kVnFrameBytes + 1) return false;
   Serial2.read();  // the sync byte itself
 
@@ -327,9 +457,10 @@ bool readOneSample() {
   const uint16_t checksum =
       (uint16_t)((g_frame[kVnFrameBytes - 2] << 8) | g_frame[kVnFrameBytes - 1]);
   if (vnCrc16(g_frame, kVnFrameBytes - 2) != checksum) {
-    bumpSaturating(&g_bad_crc);
+    if (g_imu_locked) bumpSaturating(&g_bad_crc);
     return false;
   }
+  g_imu_locked = true;
 
   // CRC passed, so these bytes really are what the IMU meant to send.  If the
   // header is not what we compiled for, the payload after it is a different
@@ -391,6 +522,11 @@ void loop() {
     if (!readOneSample()) break;
   }
 
+  // RC only once no complete IMU frame is waiting.  An SBUS frame left in
+  // Serial7's buffer costs nothing -- SbusRx keeps the newest -- while an IMU
+  // frame left waiting is a late sample.
+  if (Serial2.available() < kVnFrameBytes + 1) pollRc();
+
   const bool imu_alive =
       g_last_sample_ms != 0 && (millis() - g_last_sample_ms) < kImuTimeoutMs;
   updateLed(imu_alive);
@@ -411,6 +547,22 @@ void loop() {
                   g_host_port, g_have_subscriber ? "" : " (default)");
       last_seq = g_seq;
     }
+
+    static uint32_t last_rc_frames = 0;
+    if (!g_have_rc || (millis() - g_last_rc_ms) >= kDashRcNoSignalMs) {
+      debug_print("[RC] no SBUS frames -- check the receiver on pin 28 (RX7), "
+                  "its power, and that it is bound\n");
+    } else {
+      // Grouped as the lab's parser read them: sticks | switches | knobs.
+      debug_print("[RC] %lu Hz  lost_frames %u%s  ch %4u %4u %4u %4u | %4u %4u "
+                  "%4u %4u %4u %4u | %4u %4u\n",
+                  (unsigned long)(g_rc_frames - last_rc_frames),
+                  g_rc_lost_frames, g_rc_failsafe ? "  FAILSAFE" : "",
+                  g_rc_ch[0], g_rc_ch[1], g_rc_ch[2], g_rc_ch[3], g_rc_ch[4],
+                  g_rc_ch[5], g_rc_ch[6], g_rc_ch[7], g_rc_ch[8], g_rc_ch[9],
+                  g_rc_ch[10], g_rc_ch[11]);
+    }
+    last_rc_frames = g_rc_frames;
   }
 #endif
 #endif

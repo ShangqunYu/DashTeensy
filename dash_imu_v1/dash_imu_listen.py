@@ -4,6 +4,8 @@
     python3 dash_imu_listen.py           # one summary line per second
     python3 dash_imu_listen.py --raw     # every packet
     python3 dash_imu_listen.py --rpy     # live roll/pitch/yaw gauges
+    python3 dash_imu_listen.py --rc      # live table of every RC channel
+    python3 dash_imu_listen.py --rc --raw   # every RC packet, one per line
 
 Keeps the subscription alive with a hello a few times a second, so the board
 streams to this process's own port rather than to the compiled-in default.
@@ -20,12 +22,44 @@ import time
 
 MAGIC_DATA = 0xDA61
 MAGIC_HELLO = 0xDA62
+MAGIC_RC = 0xDA63
 VERSION = 1
 BOARD = ("192.168.0.113", 8006)
 
 # Must match DashImuPacket exactly: <HBB I I H H 4f 3f 3f B = 57 bytes.
 PACKET = struct.Struct("<HBBIIHH4f3f3fB")
 HELLO = struct.Struct("<HBBB")
+# Must match DashRcPacket exactly: <HBB I I B H H 16H B = 50 bytes.
+RC_PACKET = struct.Struct("<HBBIIBHH16HB")
+
+RC_FLAG_LOST_FRAME = 1 << 0
+RC_FLAG_FAILSAFE = 1 << 1
+RC_FLAG_CH17 = 1 << 2
+RC_FLAG_CH18 = 1 << 3
+RC_FLAG_NO_SIGNAL = 1 << 4
+RC_FLAG_NAMES = ((RC_FLAG_LOST_FRAME, "lost"), (RC_FLAG_FAILSAFE, "failsafe"),
+                 (RC_FLAG_CH17, "ch17"), (RC_FLAG_CH18, "ch18"),
+                 (RC_FLAG_NO_SIGNAL, "no-signal"))
+
+# FrSky SBUS endpoints for -100 / +100 %, and the lab's stick scaling.
+SBUS_MIN, SBUS_MAX = 172, 1811
+
+# What the lab's host parser (VN100UDPBridge.cpp) assumed each channel was.
+# Set by the model's mixer on the Taranis X7, so unverified on Dash's radio.
+LAB_RC_NAMES = {
+    0: "left stick [1]",
+    1: "right stick [0]",
+    2: "right stick [1]",
+    3: "left stick [0]",
+    4: "left lower-left switch",
+    5: "left lower-right switch",
+    6: "left upper switch",
+    7: "right lower-left switch",
+    8: "right lower-right switch",
+    9: "right upper switch",
+    10: "knob [0]",
+    11: "knob [1]",
+}
 
 HELLO_PERIOD_S = 0.2
 RPY_REDRAW_HZ = 20.0
@@ -142,6 +176,119 @@ def parse(data):
     }
 
 
+def parse_rc(data):
+    if len(data) != RC_PACKET.size:
+        return None
+    if crc8(data[:-1]) != data[-1]:
+        return None
+    f = RC_PACKET.unpack(data)
+    if f[0] != MAGIC_RC or f[1] != VERSION:
+        return None
+    # f = (magic, version, status, seq, teensy_us, flags, lost_frames, age_ms,
+    #      ch0 .. ch15, crc)
+    return {
+        "status": f[2],
+        "seq": f[3],
+        "teensy_us": f[4],
+        "flags": f[5],
+        "lost_frames": f[6],
+        "age_ms": f[7],
+        "ch": f[8:24],
+    }
+
+
+def rc_percent(raw):
+    """Raw SBUS to -100..+100 %, the lab parser's scale_joystick() times 100."""
+    return ((raw - SBUS_MIN) * 2.0 / (SBUS_MAX - SBUS_MIN) - 1.0) * 100.0
+
+
+def rc_flag_names(flags):
+    return ",".join(name for bit, name in RC_FLAG_NAMES if flags & bit) or "-"
+
+
+def rc_status(rc):
+    """What a controller should make of this packet -- dash_rc_usable()."""
+    if rc["flags"] & RC_FLAG_FAILSAFE:
+        return "FAILSAFE"
+    if rc["flags"] & RC_FLAG_NO_SIGNAL:
+        age = "never" if rc["age_ms"] == 0xFFFF else f"{rc['age_ms']} ms ago"
+        return f"NO SIGNAL (last frame {age})"
+    return "OK"
+
+
+def format_rc_line(rc):
+    return (f"{rc['seq']:8d}  {rc_status(rc):<9s}  flags {rc_flag_names(rc['flags']):<9s}  "
+            f"lost {rc['lost_frames']:5d}  ch " +
+            " ".join(f"{c:4d}" for c in rc["ch"]))
+
+
+class RcView:
+    """Live table of every RC channel under a status line saying whether to
+    trust them. Redrawn in place, so it wants a terminal, not a pipe."""
+
+    STALE_S = 0.5
+
+    def __init__(self):
+        self.rc = None
+        self.last_rx = 0.0
+        self.last_seq = None
+        self.dropped = 0
+        self.lo = [None] * 16
+        self.hi = [None] * 16
+        self.window_start = time.time()
+        self.frames = 0
+        self.hz = 0.0
+        self.drawn = False
+
+    def update(self, rc, now):
+        if self.last_seq is not None and rc["seq"] != self.last_seq + 1:
+            self.dropped += (rc["seq"] - self.last_seq - 1) & 0xFFFFFFFF
+        self.last_seq = rc["seq"]
+        self.rc = rc
+        self.last_rx = now
+        # Heartbeats repeat the last frame's channels; only real frames count
+        # towards the rate and the min/max.
+        if not rc["flags"] & RC_FLAG_NO_SIGNAL:
+            self.frames += 1
+            for i, v in enumerate(rc["ch"]):
+                self.lo[i] = v if self.lo[i] is None else min(self.lo[i], v)
+                self.hi[i] = v if self.hi[i] is None else max(self.hi[i], v)
+
+    def draw(self, now):
+        if now - self.window_start >= 1.0:
+            self.hz = self.frames / (now - self.window_start)
+            self.frames = 0
+            self.window_start = now
+
+        rc = self.rc
+        if rc is None or now - self.last_rx > self.STALE_S:
+            status = "NO RC PACKETS (board not streaming, or firmware without RC)"
+        else:
+            status = rc_status(rc)
+        lost = rc["lost_frames"] if rc else 0
+        flags = rc_flag_names(rc["flags"]) if rc else "-"
+        lines = [
+            f"RC {status}",
+            f"   {self.hz:5.1f} frames/s   lost_frames {lost}   "
+            f"dropped {self.dropped}   flags {flags}",
+            f"ch    raw  -100%{'':11s}0{'':11s}+100%    pct   min   max  "
+            f"lab assignment",
+        ]
+        for i in range(16):
+            raw = rc["ch"][i] if rc else 0
+            pct = rc_percent(raw) if rc else 0.0
+            lo = "" if self.lo[i] is None else self.lo[i]
+            hi = "" if self.hi[i] is None else self.hi[i]
+            lines.append(f"ch{i:<2d} {raw:5d}  [{bar(pct, 100.0, 29)}] {pct:+5.0f}%"
+                         f" {lo:>5} {hi:>5}  {LAB_RC_NAMES.get(i, '')}")
+
+        if self.drawn:
+            sys.stdout.write(f"\033[{len(lines)}A")
+        sys.stdout.write("".join(line + "\033[K\n" for line in lines))
+        sys.stdout.flush()
+        self.drawn = True
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--raw", action="store_true", help="print every packet")
@@ -151,9 +298,16 @@ def main():
                     help=f"how the VN-100 sits on the torso "
                          f"(default {DEFAULT_MOUNT}); 'none' reports the "
                          f"sensor frame exactly as it comes off the wire")
+    ap.add_argument("--rc", action="store_true",
+                    help="show the RC receiver instead of the IMU: a live "
+                         "table of all 16 channels, or with --raw every "
+                         "RC packet")
     ap.add_argument("--board", default=BOARD[0])
     ap.add_argument("--port", type=int, default=BOARD[1])
     args = ap.parse_args()
+    if args.rc and args.rpy:
+        ap.error("--rc and --rpy are separate views; pick one")
+    rc_view = RcView() if args.rc and not args.raw else None
 
     # One inverse, once: every sample is reported in body frame from here on.
     q_mount_inv = quat_conj(MOUNTS[args.mount])
@@ -179,9 +333,29 @@ def main():
             sock.sendto(hello, (args.board, args.port))
             last_hello = now
 
+        # Drawn on a clock rather than per packet: frames arrive at ~110 Hz,
+        # and when none do at all, the table still has to say so.
+        if rc_view is not None and now - last_redraw >= 1.0 / RPY_REDRAW_HZ:
+            rc_view.draw(now)
+            last_redraw = now
+
         try:
             data, _ = sock.recvfrom(256)
         except socket.timeout:
+            continue
+
+        # RC receiver packets share the stream with the IMU's.
+        if data[:2] == struct.pack("<H", MAGIC_RC):
+            if args.rc:
+                rc = parse_rc(data)
+                if rc is None:
+                    print("bad RC packet", file=sys.stderr)
+                elif rc_view is not None:
+                    rc_view.update(rc, time.time())
+                else:
+                    print(format_rc_line(rc))
+            continue
+        if args.rc:
             continue
 
         pkt = parse(data)
